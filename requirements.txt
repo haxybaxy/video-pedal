@@ -1,0 +1,3 @@
+opencv-python>=4.10
+pyvirtualcam>=0.14      # macOS: needs OBS 30+ installed and its virtual camera started once
+pynput>=1.7             # global hold/release pedal key
