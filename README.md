@@ -1,12 +1,10 @@
-# loop pedal
+# video pedal
 
-A loop pedal for your webcam. Hold a key while you look at the camera; let go and
+A loop pedal for your webcam. Hold a right option while you look at the camera; let go and
 the call sees that clip on repeat while you do something else. Tap the key to go
 live again.
 
-**The pedal key is the right Option key (⌥, the one to the right of the space bar,
-next to the right Command key).** Hold it to record, release it to loop, tap it to
-go live. Change it with `--key`.
+**The pedal key is the right Option key, hold it to record and release to play the loop into the camera feed. Tap right command to go back live.** Change it with `--key`.
 
 ## First run, step by step
 
