@@ -1,4 +1,4 @@
-# loop pedal
+# video pedal
 
 A loop pedal for your webcam. Hold a key while you look at the camera; let go and
 the call sees that clip on repeat while you do something else. Press a second key
