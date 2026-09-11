@@ -4,7 +4,9 @@ loop_pedal.py -- a loop pedal for your webcam.
 
 Hold the pedal key: the live camera keeps going out to the call while the
 frames are recorded. Release it: the recording plays on a loop to the call
-instead of the live feed. Tap it (shorter than --min-seconds): back to live.
+instead of the live feed. Press the live key once: the loop dissolves into
+the live feed. While a loop plays, the preview ghosts it over the live camera
+so you can line yourself up before going live.
 
 The output is published as the "OBS Virtual Camera" device, which Zoom, Meet,
 Teams, Discord and friends see as an ordinary webcam.
@@ -13,6 +15,8 @@ Teams, Discord and friends see as an ordinary webcam.
     python loop_pedal.py --no-vcam       # preview only, no OBS needed
     python loop_pedal.py --list-cameras  # find the index of your real webcam
     python loop_pedal.py --key f13       # use a different pedal key
+    python loop_pedal.py --live-key f14  # use a different go-live key
+    python loop_pedal.py --overlay 0     # preview shows exactly what the call sees
 """
 
 from __future__ import annotations
@@ -106,6 +110,17 @@ def build_loop(frames: list, crossfade: int, codec) -> list:
     return body + seam
 
 
+def blend_overlay(live: np.ndarray, loop: np.ndarray, alpha: float) -> np.ndarray:
+    """Preview only: the loop at `alpha` opacity over the live camera, so you can line yourself up.
+
+    Always returns a new array; the HUD draws onto its input in place.
+    """
+    a = min(1.0, max(0.0, float(alpha)))
+    if loop.shape != live.shape:
+        loop = cv2.resize(loop, (live.shape[1], live.shape[0]))
+    return cv2.addWeighted(live, 1.0 - a, loop, a, 0.0)
+
+
 class Player:
     def __init__(self, frames: list, codec, start: int = 0):
         if not frames:
@@ -132,7 +147,7 @@ class Player:
 # --------------------------------------------------------------------------- #
 
 class LoopPedal:
-    """LIVE --hold--> REC --release--> LOOP (or back to LIVE if the hold was just a tap)."""
+    """LIVE --hold--> REC --release--> LOOP --live key--> LIVE. A too-short hold is ignored."""
 
     def __init__(self, codec, fps: float, max_seconds: float, min_seconds: float,
                  crossfade_seconds: float, log=print):
@@ -143,6 +158,7 @@ class LoopPedal:
         self._min_frames = max(1, int(min_seconds * fps))
         self._crossfade = int(crossfade_seconds * fps)
         self._player: Player | None = None
+        self._fade_left = 0  # frames left in the loop-to-live dissolve
         self._log = log
 
     # -- pedal events --------------------------------------------------------
@@ -150,6 +166,10 @@ class LoopPedal:
     def pedal_down(self) -> None:
         if self.state == RECORDING:
             return
+        if self._fade_left:
+            # The live key already ended the loop; a short tap must not bring it back.
+            self._fade_left = 0
+            self._player = None
         self._recorder.take()
         self.state = RECORDING
         self._log("REC   recording (live feed still going out) - release to loop")
@@ -159,7 +179,9 @@ class LoopPedal:
             return
         frames = self._recorder.take()
         if len(frames) < self._min_frames:
-            self.go_live()
+            # Too short to loop: throw it away and carry on with whatever was playing.
+            self.state = LOOPING if self._player is not None else LIVE
+            self._log(f"{self.state:<5} tap ignored (hold at least {self._min_frames / self.fps:.1f}s to record)")
             return
         loop = build_loop(frames, self._crossfade, self._codec)
         # Start playback just before the seam: the newest frames dissolve into the
@@ -168,7 +190,7 @@ class LoopPedal:
         start = len(loop) - k - 1 if k > 0 else 0
         self._player = Player(loop, self._codec, start=start)
         self.state = LOOPING
-        self._log(f"LOOP  playing {len(loop) / self.fps:.1f}s loop - hold to re-record, tap to go live")
+        self._log(f"LOOP  playing {len(loop) / self.fps:.1f}s loop - hold pedal to re-record, live key to go live")
 
     def toggle_record(self) -> None:
         """For keyboards without press/release events (the preview window)."""
@@ -178,8 +200,19 @@ class LoopPedal:
             self.pedal_down()
 
     def go_live(self) -> None:
+        if self.state == LIVE:
+            return
+        if self.state == LOOPING and self._fade_left > 0:
+            return  # already dissolving; let it finish
         self._recorder.take()
+        if self.state == LOOPING and self._crossfade > 0 and self._player is not None:
+            # Keep playing while process() dissolves the loop into the live frames.
+            self._fade_left = self._crossfade
+            self._log(f"LIVE  dissolving loop into live over {self._crossfade / self.fps:.1f}s")
+            return
+        # From REC the call already sees live, so a cut is invisible.
         self._player = None
+        self._fade_left = 0
         self.state = LIVE
         self._log("LIVE  live feed - hold the pedal key to record")
 
@@ -191,7 +224,16 @@ class LoopPedal:
             self._recorder.push(live_frame)
             return live_frame
         if self.state == LOOPING and self._player is not None:
-            return self._player.next()
+            loop_frame = self._player.next()
+            if self._fade_left == 0:
+                return loop_frame
+            # Same ramp as the loop seam: live weight runs 1/(k+1) .. k/(k+1), then pure live.
+            a = (self._crossfade - self._fade_left + 1) / (self._crossfade + 1)
+            self._fade_left -= 1
+            if self._fade_left == 0:
+                self._player = None
+                self.state = LIVE
+            return cv2.addWeighted(loop_frame, 1.0 - a, live_frame, a, 0.0)
         return live_frame
 
     def hud_info(self) -> dict:
@@ -223,13 +265,23 @@ def parse_key(keyboard, name: str):
 
 
 class Pedal:
-    """Listens for one key system-wide and queues 'down' / 'up' events, ignoring key-repeat."""
+    """Listens system-wide for two keys, ignoring key-repeat.
 
-    def __init__(self, key_name: str, events: queue.Queue):
+    The pedal key queues 'down' / 'up'. The live key queues 'live' once per solo press:
+    released with nothing else pressed in between, so a shortcut like right-Cmd+Tab in
+    the focused app does not end your loop.
+    """
+
+    def __init__(self, key_name: str, events: queue.Queue, live_key_name: str | None = None):
         from pynput import keyboard  # imported lazily so --no-pedal works without it
         self._key = parse_key(keyboard, key_name)
+        self._live_key = parse_key(keyboard, live_key_name) if live_key_name else None
+        if self._live_key is not None and self._live_key == self._key:
+            raise SystemExit(f"--live-key must differ from --key (both are {key_name!r})")
         self._events = events
         self._held = False
+        self._live_held = False
+        self._live_solo = False
         self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
 
     def start(self) -> bool:
@@ -242,6 +294,13 @@ class Pedal:
         self._listener.stop()
 
     def _on_press(self, key) -> None:
+        if self._live_key is not None and key == self._live_key:
+            if not self._live_held:
+                self._live_held = True
+                self._live_solo = True
+            return
+        if self._live_held:
+            self._live_solo = False  # another key while the live key is down: a shortcut, not a tap
         if key == self._key and not self._held:
             self._held = True
             self._events.put("down")
@@ -250,6 +309,10 @@ class Pedal:
         if key == self._key and self._held:
             self._held = False
             self._events.put("up")
+        elif self._live_key is not None and key == self._live_key and self._live_held:
+            self._live_held = False
+            if self._live_solo:
+                self._events.put("live")
 
 
 # --------------------------------------------------------------------------- #
@@ -403,7 +466,7 @@ STATE_STYLE = {   # colour (BGR), title
 }
 
 
-def draw_hud(img: np.ndarray, info: dict, key: str) -> None:
+def draw_hud(img: np.ndarray, info: dict, key: str, live_key: str) -> None:
     """Status bar across the top of the preview: badge, timer, progress bar, hints."""
     h, w = img.shape[:2]
     scale = max(0.6, min(1.0, w / 1280))
@@ -447,8 +510,8 @@ def draw_hud(img: np.ndarray, info: dict, key: str) -> None:
     # hints, right-aligned
     hints = {
         LIVE: f"hold {key} to record",
-        RECORDING: f"release {key} to loop",
-        LOOPING: f"hold {key}: re-record   tap: go live",
+        RECORDING: f"release {key} to loop   {live_key}: cancel",
+        LOOPING: f"hold {key}: re-record   {live_key}: go live",
     }[state]
     fs_h = 0.55 * scale
     (hw, hh), _ = cv2.getTextSize(hints, FONT, fs_h, 1)
@@ -479,13 +542,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--fps", type=float, default=30.0, help="output frame rate (default 30)")
     ap.add_argument("--key", default="alt_r",
                     help="pedal key, held to record (default alt_r = right Option; try f13, or a letter)")
+    ap.add_argument("--live-key", default="cmd_r",
+                    help="key that ends the loop (or cancels a recording) with one press "
+                         "(default cmd_r = right Command; try f14)")
     ap.add_argument("--no-pedal", action="store_true", help="no global hotkey; control from the preview window only")
     ap.add_argument("--no-vcam", action="store_true", help="preview only; don't publish the virtual camera")
     ap.add_argument("--no-preview", action="store_true", help="don't open the preview window (Ctrl+C to quit)")
     ap.add_argument("--max-seconds", type=float, default=30.0, help="longest recording kept (default 30)")
     ap.add_argument("--min-seconds", type=float, default=1.0,
-                    help="holds shorter than this count as a tap = go live (default 1.0)")
-    ap.add_argument("--crossfade", type=float, default=0.5, help="seconds of dissolve at the loop seam (default 0.5, 0 = hard cut)")
+                    help="holds shorter than this are ignored (default 1.0)")
+    ap.add_argument("--crossfade", type=float, default=0.5,
+                    help="seconds of dissolve at the loop seam and when the loop ends (default 0.5, 0 = hard cut)")
+    ap.add_argument("--overlay", type=float, default=0.5,
+                    help="preview only: opacity of the loop ghosted over your live camera while looping, "
+                         "so you can line up before going live (default 0.5, 0 = off)")
     ap.add_argument("--quality", type=int, default=90, help="JPEG quality for frames held in RAM (default 90)")
     return ap.parse_args(argv)
 
@@ -503,16 +573,19 @@ def main(argv=None) -> int:
                       args.crossfade, log=lambda m: print(time.strftime("%H:%M:%S"), m))
 
     events: queue.Queue = queue.Queue()
-    pedal_label = key_label(args.key) if not args.no_pedal else "r"
     hotkey = None
+    pedal_on = False
     if not args.no_pedal:
-        hotkey = Pedal(args.key, events)
-        if hotkey.start():
-            print(f"Pedal key: '{args.key}'  hold = record, release = loop, tap = live  (works from any app)")
+        hotkey = Pedal(args.key, events, args.live_key)
+        pedal_on = hotkey.start()
+        if pedal_on:
+            print(f"Pedal key: '{args.key}'  hold = record, release = loop  (works from any app)")
+            print(f"Live key:  '{args.live_key}'  press once = end the loop / cancel a recording, go live")
         else:
-            print("!! macOS is not letting this terminal watch the keyboard, so the global pedal key is off.\n"
+            print("!! macOS is not letting this terminal watch the keyboard, so the global pedal and live keys are off.\n"
                   "   System Settings > Privacy & Security > Input Monitoring: enable your terminal app, restart it.\n"
                   "   Until then use the preview window keys.")
+    pedal_label, live_label = (key_label(args.key), key_label(args.live_key)) if pedal_on else ("r", "l")
 
     vcam = None
     if not args.no_vcam:
@@ -548,6 +621,8 @@ def main(argv=None) -> int:
                     pedal.pedal_down()
                 elif ev == "up":
                     pedal.pedal_up()
+                elif ev == "live":
+                    pedal.go_live()
 
             out = pedal.process(frame)
 
@@ -556,8 +631,11 @@ def main(argv=None) -> int:
                 vcam.sleep_until_next_frame()
 
             if not args.no_preview:
-                preview = cv2.flip(out, 1)  # mirror the self-view only; the call gets it unmirrored
-                draw_hud(preview, pedal.hud_info(), pedal_label)
+                shown = out
+                if args.overlay > 0 and pedal.state == LOOPING:
+                    shown = blend_overlay(frame, out, args.overlay)  # ghost the loop over the live view
+                preview = cv2.flip(shown, 1)  # mirror the self-view only; the call gets it unmirrored
+                draw_hud(preview, pedal.hud_info(), pedal_label, live_label)
                 cv2.imshow(window, preview)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
