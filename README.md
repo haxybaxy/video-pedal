@@ -23,8 +23,10 @@ without any hardware.
 - While a loop plays, the preview window ghosts it over the live camera at half
   opacity, so you can line yourself up with the loop before ending it.
 
-Both keys are global hotkeys and work while any other app has focus. Change them with
-`--key` and `--live-key`.
+Both keys are global hotkeys and work while any other app has focus. On Windows and
+Linux the same defaults are right Alt and the right Windows / Super key (see
+[Keys on Windows and Linux](#keys-on-windows-and-linux)). Change them with `--key`
+and `--live-key`.
 
 ## How it works
 
@@ -56,12 +58,18 @@ Per frame: camera → `LoopPedal.process()` → virtual camera + preview window.
   itself. So discovery reads a few frames from each index and picks the first one
   whose frames actually change over time.
 - **Virtual camera.** `pyvirtualcam` publishes BGR frames to OBS's virtual camera
-  device, which macOS exposes as a normal camera to every app.
+  device (a v4l2loopback device on Linux), which the OS exposes as a normal camera
+  to every app.
 - **Tests.** 31 tests cover the loop builder, ring buffer, player, state machine
   (including the dissolve to live), the overlay blend and the two-key hotkey mapping.
   They swap in a raw codec for JPEG and never touch a camera.
 
-## Setup (macOS)
+## Setup
+
+macOS, Windows and Linux. The one-time part is getting a virtual camera device onto
+the system; after that it's `python loop_pedal.py`. I've only run this on a Mac; the
+Windows and Linux paths are what the libraries document, not something I've
+exercised, so reports welcome.
 
 ### 1. Python
 
@@ -69,40 +77,60 @@ Per frame: camera → `LoopPedal.process()` → virtual camera + preview window.
 git clone https://github.com/haxybaxy/video-pedal
 cd video-pedal
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### 2. OBS virtual camera (once)
+Python 3.9 or newer. Everything below assumes the venv is active.
 
-The script publishes video through OBS's virtual camera device. macOS only creates
-that device after OBS has been run once:
+### 2. Virtual camera device (once)
 
-1. Install OBS: `brew install --cask obs`.
-2. Open OBS. If it shows a setup wizard, cancel it.
-3. Click **Start Virtual Camera** (bottom right, under Controls).
-4. macOS pops up a message about a system extension. Open
+`pyvirtualcam` publishes frames to whatever virtual camera the OS has; it doesn't
+create one itself.
+
+| OS | do this |
+|---|---|
+| macOS | install [OBS Studio](https://obsproject.com) 30 or newer (`brew install --cask obs`), then follow the five steps below: macOS only creates the device after OBS's camera extension has been allowed once |
+| Windows | install [OBS Studio](https://obsproject.com). The installer registers the virtual camera driver; you never need to open OBS |
+| Linux | `sudo apt install v4l2loopback-dkms` (Debian/Ubuntu; same package name on Arch; `v4l2loopback` from RPM Fusion on Fedora), then `sudo modprobe v4l2loopback video_nr=10 card_label="Video Pedal" exclusive_caps=1` |
+
+**macOS, the five steps:**
+
+1. Open OBS. If it shows a setup wizard, cancel it.
+2. Click **Start Virtual Camera** (bottom right, under Controls).
+3. macOS pops up a message about a system extension. Open
    **System Settings > Privacy & Security**, scroll down, and **Allow** the OBS
    camera extension. Reboot if it asks you to.
-5. Back in OBS click **Stop Virtual Camera**, then quit OBS.
+4. Back in OBS click **Stop Virtual Camera**, then quit OBS.
+5. Done. You never need to open OBS again.
 
-You never need to open OBS again after this. **Keep OBS closed while using the
-script.** If OBS is open with its own virtual camera started, OBS owns the device and
-pushes its (empty, black) scene out instead of your feed.
+**macOS and Windows: keep OBS closed while using the script.** If OBS is open with
+its own virtual camera started, OBS owns the device and pushes its (empty, black)
+scene out instead of your feed.
+
+**Linux notes.** `video_nr=10` puts the device at `/dev/video10`, safely above the
+indexes camera discovery probes, so it can't be mistaken for the webcam.
+`exclusive_caps=1` is what makes Chrome, Zoom and friends list it as a camera at
+all. `card_label` is the name they show. The module is gone after a reboot; to make
+it stick:
+
+```
+echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
+echo 'options v4l2loopback video_nr=10 card_label="Video Pedal" exclusive_caps=1' | sudo tee /etc/modprobe.d/v4l2loopback.conf
+```
 
 ### 3. Permissions (once)
 
-Both are under **System Settings > Privacy & Security**:
-
-- **Camera**: so the script can read the webcam. macOS asks the first time you run it.
-- **Input Monitoring**: so the pedal and live keys are noticed while another app has
-  focus. If this is missing, the script prints a warning at startup and the two keys
-  do nothing, but the preview-window keys still work. Restart the terminal after
-  enabling it.
+| OS | camera | global hotkeys |
+|---|---|---|
+| macOS | **System Settings > Privacy & Security > Camera**: macOS asks the first time you run it | **System Settings > Privacy & Security > Input Monitoring**: enable your terminal app, then restart it. Without this the script prints a warning at startup and the two keys do nothing; the preview-window keys still work |
+| Windows | **Settings > Privacy & security > Camera**: "Let desktop apps access your camera" on | nothing to grant. One catch: if the app that has focus is running as administrator, a non-elevated script can't see its keys |
+| Linux | your user needs to be in the `video` group (`groups` to check; usually already the case) | needs X11. Under a Wayland session `pynput` can't see keys pressed in other windows; log in to an X11/Xorg session, or run with `--no-pedal` and use the preview-window keys |
 
 ### 4. Run
 
 ```
-.venv/bin/python loop_pedal.py
+python loop_pedal.py
 ```
 
 You should see:
@@ -120,7 +148,24 @@ with a red dot, or LOOP). While a loop plays, the preview ghosts the loop over y
 live camera at half opacity; the virtual camera still gets the plain loop.
 
 Start the script **before** opening the app you want to feed; most apps enumerate
-cameras once at launch. Then pick **OBS Virtual Camera** in its video settings.
+cameras once at launch. Then pick the virtual camera in its video settings:
+**OBS Virtual Camera** on macOS and Windows, **Video Pedal** on Linux (the script
+prints it as `/dev/video10`).
+
+### Keys on Windows and Linux
+
+The key names are `pynput`'s and are the same everywhere; only the physical keys
+differ. `alt_r` is right Alt and `cmd_r` is the right Windows key (right Super on
+Linux). The HUD and `--help` show the local names.
+
+Two things to watch for:
+
+- **Tapping the Windows / Super key on its own opens the Start menu or the GNOME
+  overview**, which is exactly what the live key does. Use a different one, e.g.
+  `--live-key ctrl_r`.
+- On keyboard layouts with **AltGr**, right Alt *is* AltGr and `pynput` reports it as
+  `alt_gr`, so `--key alt_r` never fires. Use `--key alt_gr`, or move the pedal to
+  `--key ctrl_r` and the live key to something else.
 
 ## Controls
 
@@ -140,13 +185,13 @@ also quits.
 ## Handy variants
 
 ```
-.venv/bin/python loop_pedal.py --no-vcam        # try it without OBS: preview only
-.venv/bin/python loop_pedal.py --list-cameras   # which index is the real webcam?
-.venv/bin/python loop_pedal.py --camera 1       # use that index
-.venv/bin/python loop_pedal.py --key f13        # different pedal key
-.venv/bin/python loop_pedal.py --live-key f14   # different go-live key (also if Karabiner remaps Command)
-.venv/bin/python loop_pedal.py --overlay 0      # no ghost: preview shows exactly what goes out
-.venv/bin/python loop_pedal.py --crossfade 0    # hard cuts at the seam and when going live
+python loop_pedal.py --no-vcam        # no virtual camera needed: preview only
+python loop_pedal.py --list-cameras   # which index is the real webcam?
+python loop_pedal.py --camera 1       # use that index
+python loop_pedal.py --key f13        # different pedal key
+python loop_pedal.py --live-key f14   # different go-live key (or ctrl_r on Windows / Linux)
+python loop_pedal.py --overlay 0      # no ghost: preview shows exactly what goes out
+python loop_pedal.py --crossfade 0    # hard cuts at the seam and when going live
 ```
 
 ## All options
@@ -170,5 +215,5 @@ also quits.
 ## Tests
 
 ```
-.venv/bin/python -m pytest
+python -m pytest
 ```

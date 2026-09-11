@@ -8,8 +8,9 @@ instead of the live feed. Press the live key once: the loop dissolves into
 the live feed. While a loop plays, the preview ghosts it over the live camera
 so you can line yourself up before going live.
 
-The output is published as the "OBS Virtual Camera" device, which Zoom, Meet,
-Teams, Discord and friends see as an ordinary webcam.
+The output is published as a virtual camera ("OBS Virtual Camera" on macOS and
+Windows, a v4l2loopback device on Linux), which Zoom, Meet, Teams, Discord and
+friends see as an ordinary webcam.
 
     python loop_pedal.py                 # preview window + virtual camera
     python loop_pedal.py --no-vcam       # preview only, no OBS needed
@@ -426,28 +427,43 @@ def open_vcam(width: int, height: int, fps: float):
         cam = pyvirtualcam.Camera(width=width, height=height, fps=fps,
                                   fmt=pyvirtualcam.PixelFormat.BGR, print_fps=False)
     except RuntimeError as exc:
-        sys.exit(
-            f"Virtual camera unavailable: {exc}\n\n"
-            "One-time setup on macOS:\n"
-            "  1. Open OBS (installed in /Applications).\n"
-            "  2. Click 'Start Virtual Camera' (bottom right). macOS will ask you to allow the\n"
-            "     OBS camera extension in System Settings > Privacy & Security. Allow it.\n"
-            "  3. Click 'Stop Virtual Camera', quit OBS. Reboot if macOS asked you to.\n"
-            "Then run this again. Use --no-vcam to try the preview without it."
-        )
+        sys.exit(f"Virtual camera unavailable: {exc}\n\n{VCAM_SETUP}\n"
+                 "Then run this again. Use --no-vcam to try the preview without it.")
     return cam
+
+
+VCAM_SETUP = {
+    "darwin": (
+        "One-time setup on macOS:\n"
+        "  1. Install OBS Studio (brew install --cask obs) and open it.\n"
+        "  2. Click 'Start Virtual Camera' (bottom right). macOS will ask you to allow the\n"
+        "     OBS camera extension in System Settings > Privacy & Security. Allow it.\n"
+        "  3. Click 'Stop Virtual Camera', quit OBS. Reboot if macOS asked you to."
+    ),
+    "win32": (
+        "One-time setup on Windows:\n"
+        "  Install OBS Studio (obsproject.com); its installer registers the virtual camera\n"
+        "  driver. Keep OBS closed while this runs."
+    ),
+}.get(sys.platform, (
+    "One-time setup on Linux (v4l2loopback):\n"
+    "  sudo apt install v4l2loopback-dkms\n"
+    "  sudo modprobe v4l2loopback video_nr=10 card_label=\"Video Pedal\" exclusive_caps=1"
+))
 
 
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
 
-KEY_LABELS = {
-    "alt": "Option", "alt_l": "left Option", "alt_r": "right Option",
-    "cmd": "Command", "cmd_l": "left Command", "cmd_r": "right Command",
-    "ctrl": "Control", "ctrl_l": "left Control", "ctrl_r": "right Control",
-    "shift": "Shift", "shift_l": "left Shift", "shift_r": "right Shift",
-}
+# What the HUD calls the modifier keys; the pynput names (alt_r, cmd_r, ...) are the same everywhere.
+_MODIFIERS = {
+    "darwin": {"alt": "Option", "cmd": "Command", "ctrl": "Control", "shift": "Shift"},
+    "win32": {"alt": "Alt", "cmd": "Win", "ctrl": "Ctrl", "shift": "Shift"},
+}.get(sys.platform, {"alt": "Alt", "cmd": "Super", "ctrl": "Ctrl", "shift": "Shift"})
+KEY_LABELS = {"alt_gr": "AltGr"}
+for _key, _label in _MODIFIERS.items():
+    KEY_LABELS.update({_key: _label, f"{_key}_l": f"left {_label}", f"{_key}_r": f"right {_label}"})
 
 
 def key_label(name: str) -> str:
@@ -541,10 +557,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--size", type=parse_size, default=(1280, 720), help="requested capture size (default 1280x720)")
     ap.add_argument("--fps", type=float, default=30.0, help="output frame rate (default 30)")
     ap.add_argument("--key", default="alt_r",
-                    help="pedal key, held to record (default alt_r = right Option; try f13, or a letter)")
+                    help=f"pedal key, held to record (default alt_r = {key_label('alt_r')}; try f13, or a letter)")
     ap.add_argument("--live-key", default="cmd_r",
                     help="key that ends the loop (or cancels a recording) with one press "
-                         "(default cmd_r = right Command; try f14)")
+                         f"(default cmd_r = {key_label('cmd_r')}; try f14)")
     ap.add_argument("--no-pedal", action="store_true", help="no global hotkey; control from the preview window only")
     ap.add_argument("--no-vcam", action="store_true", help="preview only; don't publish the virtual camera")
     ap.add_argument("--no-preview", action="store_true", help="don't open the preview window (Ctrl+C to quit)")
